@@ -1,34 +1,18 @@
-// Making a fresh bench ready: copy untracked files from the main checkout, then run the repo's setup command.
+// Making a bench ready: copy untracked files from the main checkout, install packages, run the setup command.
 
-import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { glob, mkdir, readdir, rm, stat } from "node:fs/promises";
-import { dirname, join, sep } from "node:path";
-import { promisify } from "node:util";
+import { glob, mkdir, readdir, stat } from "node:fs/promises";
+import { join, sep } from "node:path";
 import { repoAt, type Repo } from "./config.ts";
+import { clone, runShell } from "./files.ts";
 import { git } from "./git.ts";
 import { BenchError, progress, tilde } from "./log.ts";
+import { detectPackages, installPackages } from "./packages.ts";
 
-const execFileP = promisify(execFile);
-
-/** Copy-on-write on APFS (macOS) and btrfs/XFS (Linux), so even node_modules copies in seconds without using disk. */
-const CLONE = process.platform === "darwin" ? ["-c", "-R"] : ["-R", "--reflink=auto"];
-
-async function copy(from: string, to: string): Promise<void> {
-  await mkdir(dirname(to), { recursive: true });
-  try {
-    await execFileP("cp", [...CLONE, from, to]);
-  } catch {
-    // e.g. the benches are on another volume, where cloning isn't possible
-    await rm(to, { recursive: true, force: true });
-    await execFileP("cp", ["-R", from, to]);
-  }
-}
-
-/** Copy the repo's `copy` paths from the main checkout into the bench where the bench doesn't have them. */
-async function copyFromMain(repo: Repo, bench: string): Promise<void> {
+/** Copy these paths (or globs) from the main checkout where the bench doesn't have them. */
+async function copyFromMain(repo: Repo, bench: string, patterns: string[]): Promise<void> {
   const found = new Set<string>();
-  for (const pattern of repo.copy) {
+  for (const pattern of patterns) {
     for await (const path of glob(pattern, { cwd: repo.path })) found.add(path);
   }
   // a path inside another one is copied with it
@@ -48,27 +32,41 @@ async function copyFromMain(repo: Repo, bench: string): Promise<void> {
   }
   const next = jobs.values();
   const worker = async () => {
-    for (const [from, to] of next) await copy(from, to);
+    for (const [from, to] of next) await clone(from, to);
   };
   await Promise.all(Array.from({ length: 8 }, worker));
 }
 
-function runSetup(repo: Repo, bench: string): Promise<void> {
-  progress(`running ${repo.setup}`);
-  return new Promise((done, fail) => {
-    // the command's output goes to stderr too, keeping stdout for bench's result
-    spawn(repo.setup!, { shell: true, cwd: bench, env: { ...process.env, ...repo.env }, stdio: ["inherit", 2, 2] })
-      .on("error", fail)
-      .on("exit", (code) => code === 0 ? done() : fail(new BenchError(`setup failed (exit ${code}): ${repo.setup}`)));
-  });
+/**
+ * Make the checkout at `bench` ready to work in. Packages install only when the lockfile changed since the last install,
+ * and a missing node_modules starts as a copy of the main checkout's, so the install has little left to do.
+ * `setup: false` leaves out the repo's setup command (for warm benches, which don't have their branch yet).
+ */
+export async function prepareBench(repo: Repo, bench: string, { setup = true } = {}): Promise<void> {
+  const detected = repo.install === false ? undefined : detectPackages(bench);
+  // a command in "install" replaces the detected one (e.g. for another Node version manager)
+  const custom = typeof repo.install === "string" ? repo.install : undefined;
+  const packages = detected && custom ? { ...detected, command: custom } : detected;
+  // npm ci starts by deleting node_modules, so there's no point copying it
+  const seed = packages && packages.manager !== "npm" ? ["node_modules"] : [];
+  await copyFromMain(repo, bench, [...repo.copy, ...seed]);
+  if (packages) await installPackages(bench, packages, repo.env);
+  else if (custom) {
+    // without a lockfile there's no telling whether anything changed, so it runs every time
+    progress(`installing packages: ${custom}`);
+    await runShell(custom, bench, repo.env);
+  }
+  if (setup && repo.setup) {
+    progress(`running ${repo.setup}`);
+    await runShell(repo.setup, bench, repo.env);
+  }
 }
 
-/** Set up the bench at `dir`. */
+/** `bench setup`: prepare the bench at `dir`. */
 export async function setupBench(dir: string): Promise<void> {
   const repo = await repoAt(dir);
   if (!repo) throw new BenchError(`${tilde(dir)} isn't in a git repository`);
   const bench = await git(dir, "rev-parse", "--show-toplevel");
   if (bench === repo.path) throw new BenchError(`${tilde(bench)} is the main checkout, not a bench`);
-  await copyFromMain(repo, bench);
-  if (repo.setup) await runSetup(repo, bench);
+  await prepareBench(repo, bench);
 }

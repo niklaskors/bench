@@ -1,6 +1,6 @@
 // Settings: the personal config file, each repo's shared .bench.json, and which repo a command works in.
 
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { git } from "./git.ts";
@@ -16,10 +16,17 @@ interface RepoSettings {
   remote?: string;
   /** Untracked paths or globs to copy from the main checkout, copy-on-write where the disk allows. */
   copy?: string[];
-  /** Shell command run in a new bench after copying, e.g. a frozen-lockfile install. */
+  /** Shell command run in a new bench after copying and installing, e.g. code generation. */
   setup?: string;
-  /** Environment for the setup command. */
+  /** Environment for installing packages and the setup command. */
   env?: Record<string, string>;
+  /**
+   * Keep packages installed: true or false, or the install command to use instead of the detected one
+   * (default: on whenever there's a package.json with a lockfile).
+   */
+  install?: boolean | string;
+  /** How many warm benches to keep ready (default 0). */
+  pool?: number;
 }
 
 interface ConfigFile {
@@ -27,6 +34,12 @@ interface ConfigFile {
   root?: string;
   open?: OpenMode;
   command?: string;
+  /** Shell command that opens a terminal tab, for terminals bench doesn't know; gets $BENCH_PATH and $BENCH_RUN. */
+  tab?: string;
+  /** Pool size for repos that don't set one when added. */
+  pool?: number;
+  /** When the background refresh runs: daily at a time ("07:00"), or every so many minutes (a number). */
+  refresh?: string | number;
   repos?: Record<string, RepoSettings & { path: string }>;
 }
 
@@ -39,6 +52,8 @@ export interface Repo {
   copy: string[];
   setup?: string;
   env: Record<string, string>;
+  install?: boolean | string;
+  pool: number;
 }
 
 export const expandHome = (path: string) =>
@@ -62,20 +77,30 @@ function readJson<T>(path: string): T | undefined {
   }
 }
 
+// git reports worktree paths with symlinks resolved, so compare against resolved paths too
+const realpathIfExists = (path: string) => existsSync(path) ? realpathSync(path) : path;
+
 let loaded: ConfigFile | undefined;
 const config = () => (loaded ??= readJson<ConfigFile>(CONFIG_PATH) ?? {});
 
 export const settings = () => {
   const c = config();
+  const refresh = c.refresh ?? "07:00";
+  if (typeof refresh === "string" ? !/^([01]?\d|2[0-3]):[0-5]\d$/.test(refresh) : !(refresh > 0)) {
+    throw new BenchError(`${tilde(CONFIG_PATH)}: "refresh" must be a time like "07:00" or a number of minutes`);
+  }
   if (c.open && !OPEN_MODES.includes(c.open)) {
     throw new BenchError(`${tilde(CONFIG_PATH)}: "open" must be one of ${OPEN_MODES.join(", ")}`);
   }
   return {
     /** Benches live in <root>/<repo name>/<branch>. */
-    root: expandHome(c.root ?? "~/benches"),
+    root: realpathIfExists(expandHome(c.root ?? "~/benches")),
     open: c.open ?? "none",
     command: c.command,
     default: c.default,
+    tab: c.tab,
+    pool: c.pool ?? 2,
+    refresh,
   };
 };
 
@@ -83,7 +108,10 @@ function makeRepo(name: string, path: string, own: RepoSettings = {}): Repo {
   const shared = readJson<RepoSettings>(join(path, ".bench.json")) ?? {};
   const s = { ...shared, ...own };
   const env = Object.fromEntries(Object.entries({ ...shared.env, ...own.env }).map(([k, v]) => [k, expandHome(v)]));
-  return { name, path, base: s.base, remote: s.remote ?? "origin", copy: s.copy ?? [], setup: s.setup, env };
+  return {
+    name, path, base: s.base, remote: s.remote ?? "origin", copy: s.copy ?? [], setup: s.setup, env,
+    install: s.install, pool: s.pool ?? 0,
+  };
 }
 
 export function configuredRepos(): Repo[] {
@@ -98,8 +126,18 @@ export function configuredRepos(): Repo[] {
   });
 }
 
+/** Add or update a repo in the config file, and make it the default if asked. */
+export function saveRepo(name: string, entry: RepoSettings & { path: string }, makeDefault: boolean): void {
+  const file = readJson<ConfigFile>(CONFIG_PATH) ?? {};
+  file.repos = { ...file.repos, [name]: { ...file.repos?.[name], ...entry } };
+  if (makeDefault) file.default = name;
+  mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+  writeFileSync(CONFIG_PATH, JSON.stringify(file, null, 2) + "\n");
+  loaded = file;
+}
+
 /** The main checkout of the repository around `dir` (also when `dir` is in one of its worktrees). */
-async function mainCheckout(dir: string): Promise<string | undefined> {
+export async function mainCheckout(dir: string): Promise<string | undefined> {
   const common = await git(dir, "rev-parse", "--path-format=absolute", "--git-common-dir").catch(() => "");
   // a bare repository has no checkout of its own
   return basename(common) === ".git" ? realpathSync(dirname(common)) : undefined;

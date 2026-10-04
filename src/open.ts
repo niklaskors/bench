@@ -3,14 +3,14 @@
 import { execFile, spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { promisify } from "node:util";
-import type { OpenMode } from "./config.ts";
+import { settings, type OpenMode } from "./config.ts";
 import { BenchError, shellQuote } from "./log.ts";
 
 const execFileP = promisify(execFile);
 
 const appleString = (s: string) => `"${s.replace(/[\\"]/g, "\\$&")}"`;
 
-/** AppleScript that types `line` into a new tab of the terminal bench runs in. */
+/** AppleScript that types `line` into a new tab of the terminal bench runs in, for the terminals bench knows. */
 function newTabScript(line: string): string {
   switch (process.env.TERM_PROGRAM) {
     case "iTerm.app":
@@ -29,7 +29,7 @@ function newTabScript(line: string): string {
         do script ${appleString(line)}
       end tell`;
     default:
-      throw new BenchError(`--open tab works in iTerm2 and Terminal on macOS; use --open here (TERM_PROGRAM=${process.env.TERM_PROGRAM ?? ""})`);
+      throw new BenchError(`--open tab knows iTerm2 and Terminal on macOS; for others set "tab" in the config (TERM_PROGRAM=${process.env.TERM_PROGRAM ?? ""})`);
   }
 }
 
@@ -41,7 +41,12 @@ export async function openBench(path: string, mode: OpenMode, command: string | 
   if (mode === "tab") {
     const self = shellQuote(realpathSync(process.argv[1]));
     const line = [`cd ${shellQuote(path)}`, setupFirst && `${self} setup`, command].filter(Boolean).join(" && ");
-    await execFileP("osascript", ["-e", newTabScript(line)]);
+    const custom = settings().tab;
+    if (!custom) await execFileP("osascript", ["-e", newTabScript(line)]);
+    else {
+      const env = { ...process.env, BENCH_PATH: path, BENCH_RUN: line };
+      await execFileP(process.env.SHELL || "sh", ["-c", custom], { env });
+    }
   } else if (mode === "here") {
     const shell = process.env.SHELL || "sh";
     const child = command ? spawn(command, { shell, cwd: path, stdio: "inherit" })

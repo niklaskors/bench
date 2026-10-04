@@ -1,12 +1,13 @@
 // Benches: creating one for a branch, finding them, and removing them.
 
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, rename } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { knownRepos, settings, type Repo } from "./config.ts";
-import { git, hasRef, worktrees, type Worktree } from "./git.ts";
+import { discard } from "./files.ts";
+import { defaultBase, git, hasRef, worktrees, type Worktree } from "./git.ts";
 import { BenchError, progress, tilde } from "./log.ts";
+import { inPool, refreshInBackground, takeWarmBench } from "./pool.ts";
 
 export interface NewBench {
   repo: string;
@@ -16,16 +17,12 @@ export interface NewBench {
   created: boolean;
   /** Where the branch came from: the local branch, the remote one, or the base it was made from. */
   from?: string;
+  /** Made from a warm bench of the pool. */
+  warm?: boolean;
 }
 
 /** The directory name for a branch: feat/PROJ-1-x becomes feat-PROJ-1-x. */
 const dirName = (branch: string) => branch.replace(/[^\w.-]+/g, "-");
-
-async function defaultBase(repo: Repo): Promise<string> {
-  const head = await git(repo.path, "symbolic-ref", "--quiet", "--short", `refs/remotes/${repo.remote}/HEAD`)
-    .catch(() => "");
-  return head ? head.slice(repo.remote.length + 1) : "main";
-}
 
 /** Give `branch` a bench: reuse its worktree, else check out the local or remote branch, else branch off the base. */
 export async function newBench(repo: Repo, branch: string, from?: string): Promise<NewBench> {
@@ -49,28 +46,41 @@ export async function newBench(repo: Repo, branch: string, from?: string): Promi
   ]);
 
   await mkdir(dirname(path), { recursive: true });
-  let start;
-  if (await hasRef(repo.path, `refs/heads/${branch}`)) {
-    progress(`checking out the local ${branch} in ${tilde(path)}`);
-    await git(repo.path, "worktree", "add", path, branch);
+  const local = await hasRef(repo.path, `refs/heads/${branch}`);
+  let start, track;
+  if (local) {
     start = branch;
   } else if (onRemote) {
     start = `${remote}/${branch}`;
+    track = "--track";
     await git(repo.path, "fetch", "--quiet", remote, `refs/heads/${branch}:refs/remotes/${start}`);
-    progress(`checking out ${start} in ${tilde(path)}`);
-    await git(repo.path, "worktree", "add", "--track", "-b", branch, path, start);
   } else {
     start = await hasRef(repo.path, `refs/remotes/${remote}/${base}`) ? `${remote}/${base}` : base;
-    progress(`creating ${branch} from ${start} in ${tilde(path)}`);
-    await git(repo.path, "worktree", "add", "--no-track", "-b", branch, path, start);
+    track = "--no-track";
   }
-  return { repo: repo.name, branch, path, created: true, from: start };
+  const doing = local ? `checking out the local ${branch}` : onRemote ? `checking out ${start}` : `creating ${branch} from ${start}`;
+
+  const warm = repo.pool ? await takeWarmBench(repo) : undefined;
+  if (warm) {
+    progress(`${doing} in a warm bench, moved to ${tilde(path)}`);
+    try {
+      await git(warm.path, "switch", ...local ? [branch] : [track!, "-c", branch, start]);
+      await git(repo.path, "worktree", "move", warm.path, path);
+    } finally {
+      await warm.done();
+    }
+  } else {
+    progress(`${doing} in ${tilde(path)}${repo.pool ? " (no warm bench ready)" : ""}`);
+    await git(repo.path, "worktree", "add", ...local ? [path, branch] : [track!, "-b", branch, path, start]);
+  }
+  if (repo.pool) refreshInBackground(repo);
+  return { repo: repo.name, branch, path, created: true, from: start, warm: !!warm };
 }
 
 /** The benches (worktrees other than the main checkout) of the given repos, or of every known repo. */
 export async function benches(repos?: Repo[]): Promise<Worktree[]> {
   const all = await Promise.all((repos ?? await knownRepos()).map(worktrees));
-  return all.flat().filter((w) => !w.main);
+  return all.flat().filter((w) => !w.main && !inPool(w.repo, w.path));
 }
 
 /** The one bench whose branch is `query`, or else contains it (ignoring case). */
@@ -100,10 +110,8 @@ export async function removeBench(bench: Worktree, { force = false, deleteBranch
       throw new BenchError(`${tilde(path)} has ${unpushed} commit(s) that aren't on ${repo.remote} (use --force to remove anyway)`);
     }
   }
-  const trash = join(dirname(path), `.${basename(path)}.removing-${Date.now()}`);
-  await rename(path, trash);
+  await discard(path);
   await git(repo.path, "worktree", "prune");
-  spawn("rm", ["-rf", trash], { stdio: "ignore", detached: true }).unref();
   if (deleteBranch && branch) await git(repo.path, "branch", "-D", branch);
   progress(`removed ${tilde(path)}${branch ? `; branch ${branch} ${deleteBranch ? "deleted" : "kept"}` : ""}`);
 }

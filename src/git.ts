@@ -22,6 +22,13 @@ export async function git(cwd: string, ...args: string[]): Promise<string> {
 export const hasRef = (cwd: string, ref: string) =>
   git(cwd, "rev-parse", "--verify", "--quiet", ref).then(() => true, () => false);
 
+/** The branch the remote's HEAD points at, e.g. main. */
+export async function defaultBase(repo: Repo): Promise<string> {
+  const head = await git(repo.path, "symbolic-ref", "--quiet", "--short", `refs/remotes/${repo.remote}/HEAD`)
+    .catch(() => "");
+  return head ? head.slice(repo.remote.length + 1) : "main";
+}
+
 export interface Worktree {
   repo: Repo;
   path: string;
