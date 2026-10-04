@@ -1,0 +1,18 @@
+{
+  // Type checking only: Node runs the .ts files directly by stripping the types,
+  // which is why only erasable TypeScript syntax is allowed and imports end in .ts.
+  "compilerOptions": {
+    "strict": true,
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "noUnusedLocals": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["bin", "src"]
+}
