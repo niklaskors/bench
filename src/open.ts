@@ -33,6 +33,11 @@ function newTabScript(line: string): string {
   }
 }
 
+/** Open a URL in the default browser. */
+export async function openUrl(url: string): Promise<void> {
+  await execFileP(process.platform === "darwin" ? "open" : "xdg-open", [url]);
+}
+
 /**
  * Start `command` (or a shell) in the bench. With `setupFirst`, `bench setup` runs before it,
  * so a new tab shows the install while the caller has already moved on.

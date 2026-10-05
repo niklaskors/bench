@@ -6,7 +6,9 @@ import { basename, dirname, join } from "node:path";
 import { knownRepos, settings, type Repo } from "./config.ts";
 import { discard } from "./files.ts";
 import { defaultBase, git, hasRef, worktrees, type Worktree } from "./git.ts";
+import { readHistory, remember, updateHistory, type RemovedBench } from "./history.ts";
 import { BenchError, progress, tilde } from "./log.ts";
+import { mergeRequest, type MergeRequest } from "./mr.ts";
 import { inPool, refreshInBackground, takeWarmBench } from "./pool.ts";
 
 export interface NewBench {
@@ -83,6 +85,48 @@ export async function benches(repos?: Repo[]): Promise<Worktree[]> {
   return all.flat().filter((w) => !w.main && !inPool(w.repo, w.path));
 }
 
+/** A bench that was removed: its files are gone, but bench remembers its branch and merge request. */
+export interface PastBench extends Worktree {
+  branch: string;
+  removed: string;
+  entry: RemovedBench;
+}
+
+/** The removed benches of these repos, except branches that have a bench again. */
+export function pastBenches(repos: Repo[], active: Worktree[]): PastBench[] {
+  return readHistory().flatMap((entry) => {
+    const repo = repos.find((r) => r.path === entry.repoPath);
+    if (!repo || active.some((w) => w.repo.path === repo.path && w.branch === entry.branch)) return [];
+    return [{ repo, path: entry.path, branch: entry.branch, main: false, removed: entry.removed, entry }];
+  });
+}
+
+export const isPast = (bench: Worktree): bench is PastBench => "removed" in bench;
+
+/**
+ * The merge requests of these benches, looked up side by side. A removed bench's merged or closed merge request
+ * is taken from the history, since it won't change; open ones are looked up again and stored.
+ * A lookup that fails gives undefined, and `failed` gets its message.
+ */
+export async function mergeRequests(list: Worktree[], failed: (message: string) => void = () => {}):
+  Promise<(MergeRequest | null | undefined)[]> {
+  const updates: RemovedBench[] = [];
+  const mrs = await Promise.all(list.map(async (bench) => {
+    if (!bench.branch) return null;
+    if (isPast(bench) && bench.entry.mr && bench.entry.mr.state !== "open") return bench.entry.mr;
+    try {
+      const mr = await mergeRequest(bench.repo, bench.branch);
+      if (isPast(bench)) updates.push({ ...bench.entry, mr });
+      return mr;
+    } catch (e) {
+      failed((e as Error).message);
+      return isPast(bench) ? bench.entry.mr : undefined;
+    }
+  }));
+  await updateHistory(updates);
+  return mrs;
+}
+
 /** The one bench whose branch is `query`, or else contains it (ignoring case). */
 export function pick(list: Worktree[], query: string): Worktree {
   const exact = list.filter((w) => w.branch === query);
@@ -110,8 +154,11 @@ export async function removeBench(bench: Worktree, { force = false, deleteBranch
       throw new BenchError(`${tilde(path)} has ${unpushed} commit(s) that aren't on ${repo.remote} (use --force to remove anyway)`);
     }
   }
+  // remembered, so its merge request can still be found once the files are gone
+  const mr = branch ? await mergeRequest(repo, branch).catch(() => undefined) : undefined;
   await discard(path);
   await git(repo.path, "worktree", "prune");
+  if (branch) await remember({ repo: repo.name, repoPath: repo.path, branch, path, removed: new Date().toISOString(), mr });
   if (deleteBranch && branch) await git(repo.path, "branch", "-D", branch);
   progress(`removed ${tilde(path)}${branch ? `; branch ${branch} ${deleteBranch ? "deleted" : "kept"}` : ""}`);
 }

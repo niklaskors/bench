@@ -3,11 +3,13 @@
 import { parseArgs } from "node:util";
 import { addRepo } from "./add.ts";
 import { AGENT_LOG, agentInstalled, schedule, setAgent } from "./agent.ts";
-import { benches, newBench, pick, removeBench } from "./benches.ts";
-import { CONFIG_PATH, OPEN_MODES, configuredRepos, resolveRepo, settings, type OpenMode, type Repo } from "./config.ts";
+import { benches, isPast, mergeRequests, newBench, pastBenches, pick, removeBench } from "./benches.ts";
+import { CONFIG_PATH, OPEN_MODES, configuredRepos, knownRepos, resolveRepo, settings, type OpenMode, type Repo } from "./config.ts";
 import { type Worktree } from "./git.ts";
 import { BenchError, progress, tilde } from "./log.ts";
-import { openBench } from "./open.ts";
+import { HISTORY_PATH } from "./history.ts";
+import { describeMr, mrStatus } from "./mr.ts";
+import { openBench, openUrl } from "./open.ts";
 import { poolDir, refreshPool, warmBenches } from "./pool.ts";
 import { setupBench } from "./setup.ts";
 
@@ -22,8 +24,13 @@ Commands:
                   already has; otherwise checks out the local branch, the remote one,
                   or makes it from the base branch, in a warm bench when one is ready
   go <query>      print the path of the bench whose branch matches <query>
-  ls              list the benches of all repos
-  rm <query>      remove a bench; refuses uncommitted or unpushed work
+  ls              list the benches of all repos; --all also lists removed ones, --mr adds
+                  merge requests, --match REGEX keeps branches that match
+  mr <query>      print the URL of the merge request (or GitHub pull request) of a bench's
+                  branch, also of a removed bench; -w opens it in the browser.
+                  Uses glab for GitLab and gh for GitHub
+  rm <query>      remove a bench; refuses uncommitted or unpushed work. Its branch and merge
+                  request are remembered (bench ls --all)
   setup [path]    copy files from the main checkout, install packages if the lockfile
                   changed and run the setup command (new does this itself)
   repos           list the configured repos
@@ -46,16 +53,23 @@ Options:
       --default         add: make it the default repo
       --into DIR        add: where to clone a URL (default: ./<name>)
       --no-auto         add: don't turn on the background refresh
-      --json            new, go, ls, repos, pool: print JSON
+      --all             ls: also list removed benches
+      --mr              ls: look up each bench's merge request
+      --match REGEX     ls: only branches that match (ignoring case), e.g. "PROJ-1\\b|PROJ-7\\b"
+  -w, --web             mr: open the merge request in the browser
+      --json            new, go, ls, mr, repos, pool: print JSON
   -h, --help
 
 Config: ${tilde(CONFIG_PATH)} (or $BENCH_CONFIG), and .bench.json in a repo; see the README.
+Removed benches are remembered in ${tilde(HISTORY_PATH)}.
 Tip: g() { cd "$(bench go "$@")"; } jumps to a bench.`;
 
-const COMMANDS = ["add", "new", "go", "ls", "rm", "setup", "repos", "pool"];
+const COMMANDS = ["add", "new", "go", "ls", "mr", "rm", "setup", "repos", "pool"];
 
 /** The fields of a bench that callers get as JSON. */
-const describe = (w: Worktree) => ({ repo: w.repo.name, branch: w.branch ?? null, path: w.path });
+const describe = (w: Worktree) => ({
+  repo: w.repo.name, branch: w.branch ?? null, path: w.path, ...isPast(w) && { removed: w.removed },
+});
 
 /** Print rows as aligned columns. */
 function table(rows: string[][]): void {
@@ -109,6 +123,10 @@ async function main(): Promise<void> {
         default: { type: "boolean" },
         into: { type: "string" },
         "no-auto": { type: "boolean" },
+        all: { type: "boolean" },
+        mr: { type: "boolean" },
+        match: { type: "string" },
+        web: { type: "boolean", short: "w" },
         json: { type: "boolean" },
         help: { type: "boolean", short: "h" },
       },
@@ -125,7 +143,7 @@ async function main(): Promise<void> {
   if (extra.length && !(command === "pool" && arg === "auto" && extra.length === 1)) {
     usageError(`unexpected argument "${extra.at(-1)}"`);
   }
-  if (["add", "new", "go", "rm"].includes(command) && !arg) {
+  if (["add", "new", "go", "mr", "rm"].includes(command) && !arg) {
     usageError(`${command} needs a ${{ add: "path or URL", new: "branch" }[command] ?? "query"}`);
   }
   const pool = values.pool === undefined ? undefined : Number(values.pool);
@@ -169,9 +187,54 @@ async function main(): Promise<void> {
       break;
     }
     case "ls": {
-      const list = await benches(await scope());
-      if (values.json) json(list.map(describe));
-      else table(list.map((w) => [w.repo.name, w.branch ?? "(detached)", tilde(w.path)]));
+      const repos = await scope() ?? await knownRepos();
+      const active = await benches(repos);
+      let list: Worktree[] = values.all ? [...active, ...pastBenches(repos, active)] : active;
+      if (values.match) {
+        let re: RegExp;
+        try {
+          re = new RegExp(values.match, "i");
+        } catch (e) {
+          usageError(`--match: ${(e as Error).message}`);
+        }
+        list = list.filter((w) => re.test(w.branch ?? ""));
+      }
+      let failed = "";
+      const mrs = values.mr ? await mergeRequests(list, (message) => (failed = message)) : undefined;
+      if (failed) progress(`couldn't look up every merge request: ${failed}`);
+      if (values.json) json(list.map((w, i) => ({ ...describe(w), ...mrs && { mr: mrs[i] ?? null } })));
+      else {
+        table(list.map((w, i) => {
+          const mr = mrs?.[i];
+          const where = isPast(w) ? `(removed ${ago(w.removed)})` : tilde(w.path);
+          return [w.repo.name, w.branch ?? "(detached)", ...mrs ? [mr ? `${mr.id} ${mrStatus(mr)}` : "-"] : [], where];
+        }));
+      }
+      break;
+    }
+    case "mr": {
+      const repos = await scope() ?? await knownRepos();
+      const active = await benches(repos);
+      // a bench that exists wins; otherwise one that was removed
+      let bench: Worktree;
+      try {
+        bench = pick(active, arg);
+      } catch (e) {
+        const past = pastBenches(repos, active);
+        if (!past.some((w) => w.branch.toLowerCase().includes(arg.toLowerCase()))) throw e;
+        bench = pick(past, arg);
+      }
+      if (!bench.branch) throw new BenchError(`${tilde(bench.path)} isn't on a branch`);
+      const [mr] = await mergeRequests([bench], (message) => {
+        throw new BenchError(message);
+      });
+      if (values.json) json({ ...describe(bench), mr: mr ?? null });
+      else if (!mr) throw new BenchError(`no merge request for ${bench.branch}`);
+      else {
+        progress(describeMr(mr));
+        console.log(mr.url);
+      }
+      if (mr && values.web) await openUrl(mr.url);
       break;
     }
     case "rm":

@@ -63,6 +63,8 @@ bench new feat/PROJ-123-login             # bench for the branch in the default 
 bench new fix/PROJ-9 -r api --from develop
 bench go PROJ-123                         # path of the bench whose branch contains PROJ-123
 bench ls                                  # benches of all repos
+bench ls --all --mr                       # removed ones too, with their merge requests
+bench mr PROJ-123 -w                      # open the merge request of the bench's branch
 bench rm PROJ-123 -d                      # remove the bench and its local branch
 bench setup                               # redo copying, installing and setup in the bench you're in
 bench repos                               # configured repos, * is the default
@@ -73,6 +75,16 @@ bench -h                                  # all options
 
 `bench rm` refuses a bench with uncommitted changes or commits that aren't on the remote, unless you pass `--force`.
 It moves the directory aside and deletes it in the background, so it returns at once.
+
+### Merge requests and removed benches
+
+`bench mr <query>` finds the merge request of a bench's branch: with glab on GitLab (also self-hosted) and with gh on
+GitHub, which bring their own sign-in. When a branch has several, the open one wins, then the latest merged one.
+
+A removed bench's files are gone, but bench remembers its repo, branch and merge request
+(in `~/.local/state/bench/history.json`). `bench ls --all` lists removed benches too and `bench mr` still finds their
+merge request; a merged or closed one is kept, so it isn't looked up again. `bench new` on a remembered branch makes
+it a bench again.
 
 ### The pool
 
@@ -155,8 +167,10 @@ These describe how to set up a bench of a repo, so they can also be shared with 
 ## Output for other tools
 
 With `--json`, `new` prints `{ "repo", "branch", "path", "created", "from", "warm" }`, `go` prints
-`{ "repo", "branch", "path" }`, `ls` a list of those, `repos` `{ "default", "repos": [{ "name", "path", "pool" }] }`
-and `pool` the warm benches per repo. Progress always goes to stderr.
+`{ "repo", "branch", "path" }`, `ls` a list of those (with `"removed"` for removed benches and `"mr"` with `--mr`),
+`mr` one of those with `"mr": { "id", "title", "state", "draft", "url", "updated" }` or `null`,
+`repos` `{ "default", "repos": [{ "name", "path", "pool" }] }` and `pool` the warm benches per repo.
+`ls --match REGEX` keeps the benches whose branch matches, so a caller can ask about just the branches it cares about. Progress always goes to stderr.
 Exit codes: 0 done, 1 failed (with a message), 2 wrong usage.
 
 ## Development
@@ -179,6 +193,8 @@ src/add.ts         bench add: cloning, detecting, saving the repo
 src/git.ts         running git, listing worktrees
 src/benches.ts     new, finding benches, rm
 src/pool.ts        warm benches: taking one, refreshing, locking
+src/mr.ts          merge requests and pull requests, through glab and gh
+src/history.ts     removed benches: their branch and merge request
 src/agent.ts       the background refresh (launchd)
 src/setup.ts       copying from the main checkout, installing, the setup command
 src/packages.ts    detecting the package manager, installing when the lockfile changed
