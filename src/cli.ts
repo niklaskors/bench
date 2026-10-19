@@ -5,7 +5,7 @@ import { addRepo } from "./add.ts";
 import { AGENT_LOG, agentInstalled, schedule, setAgent } from "./agent.ts";
 import { benches, isPast, mergeRequests, newBench, pastBenches, pick, removeBench } from "./benches.ts";
 import { CONFIG_PATH, OPEN_MODES, configuredRepos, knownRepos, resolveRepo, settings, type OpenMode, type Repo } from "./config.ts";
-import { type Worktree } from "./git.ts";
+import { branches, git, type Worktree } from "./git.ts";
 import { BenchError, progress, tilde } from "./log.ts";
 import { HISTORY_PATH } from "./history.ts";
 import { describeMr, mrStatus } from "./mr.ts";
@@ -24,6 +24,8 @@ Commands:
                   already has; otherwise checks out the local branch, the remote one,
                   or makes it from the base branch, in a warm bench when one is ready
   go <query>      print the path of the bench whose branch matches <query>
+  branches        list the branches of a repo, local and remote, the most recently committed
+                  to first: what new --from can start from. --fetch fetches the remote first
   ls              list the benches of all repos; --all also lists removed ones, --mr adds
                   merge requests, --match REGEX keeps branches that match
   mr <query>      print the URL of the merge request (or GitHub pull request) of a bench's
@@ -45,7 +47,10 @@ Options:
                         terminal tab, where setup also runs). Default: "open" in the config, else none
   -c, --cmd COMMAND     command to start in the bench, e.g. nvim or claude (default: "command"
                         in the config, else a shell)
+  -a, --assistant CMD   new, go: assistant for the "tab" command to start next to it, e.g. claude or
+                        copilot (default: "assistant" in the config)
       --no-setup        new: skip copying, installing and the setup command
+  -t, --title TITLE     new, go: title for the terminal tab, e.g. the issue the branch is for
   -f, --force           rm: remove even with uncommitted or unpushed work
   -d, --delete-branch   rm: also delete the local branch
       --name NAME       add: name for the repo (default: its directory)
@@ -53,18 +58,19 @@ Options:
       --default         add: make it the default repo
       --into DIR        add: where to clone a URL (default: ./<name>)
       --no-auto         add: don't turn on the background refresh
+      --fetch           branches: fetch the remote first
       --all             ls: also list removed benches
       --mr              ls: look up each bench's merge request
       --match REGEX     ls: only branches that match (ignoring case), e.g. "PROJ-1\\b|PROJ-7\\b"
   -w, --web             mr: open the merge request in the browser
-      --json            new, go, ls, mr, repos, pool: print JSON
+      --json            new, go, branches, ls, mr, repos, pool: print JSON
   -h, --help
 
 Config: ${tilde(CONFIG_PATH)} (or $BENCH_CONFIG), and .bench.json in a repo; see the README.
 Removed benches are remembered in ${tilde(HISTORY_PATH)}.
 Tip: g() { cd "$(bench go "$@")"; } jumps to a bench.`;
 
-const COMMANDS = ["add", "new", "go", "ls", "mr", "rm", "setup", "repos", "pool"];
+const COMMANDS = ["add", "new", "go", "branches", "ls", "mr", "rm", "setup", "repos", "pool"];
 
 /** The fields of a bench that callers get as JSON. */
 const describe = (w: Worktree) => ({
@@ -115,7 +121,9 @@ async function main(): Promise<void> {
         from: { type: "string" },
         open: { type: "string", short: "o" },
         cmd: { type: "string", short: "c" },
+        assistant: { type: "string", short: "a" },
         "no-setup": { type: "boolean" },
+        title: { type: "string", short: "t" },
         force: { type: "boolean", short: "f" },
         "delete-branch": { type: "boolean", short: "d" },
         name: { type: "string" },
@@ -123,6 +131,7 @@ async function main(): Promise<void> {
         default: { type: "boolean" },
         into: { type: "string" },
         "no-auto": { type: "boolean" },
+        fetch: { type: "boolean" },
         all: { type: "boolean" },
         mr: { type: "boolean" },
         match: { type: "string" },
@@ -151,6 +160,7 @@ async function main(): Promise<void> {
   const open = (values.open ?? settings().open) as OpenMode;
   if (!OPEN_MODES.includes(open)) usageError(`--open must be one of ${OPEN_MODES.join(", ")}`);
   const cmd = values.cmd ?? settings().command;
+  const assistant = values.assistant ?? settings().assistant;
   const json = (value: unknown) => console.log(JSON.stringify(value, null, 2));
   /** --repo limits go, ls, rm and pool to that repo. */
   const scope = async () => values.repo ? [await resolveRepo(values.repo)] : undefined;
@@ -176,14 +186,29 @@ async function main(): Promise<void> {
       if (setup && open !== "tab") await setupBench(result.path);
       if (values.json) json(result);
       else console.log(result.path);
-      await openBench(result.path, open, cmd, setup && open === "tab");
+      await openBench(result.path, open, cmd, setup && open === "tab", values.title, assistant);
       break;
     }
     case "go": {
       const bench = pick(await benches(await scope()), arg);
       if (values.json) json(describe(bench));
       else console.log(bench.path);
-      await openBench(bench.path, open, cmd);
+      await openBench(bench.path, open, cmd, false, values.title, assistant);
+      break;
+    }
+    case "branches": {
+      const repo = await resolveRepo(values.repo);
+      if (values.fetch) {
+        progress(`fetching ${repo.remote}`);
+        await git(repo.path, "fetch", "--quiet", "--prune", repo.remote)
+          .catch((e: Error) => progress(`fetch failed, listing what's here (${e.message})`));
+      }
+      const list = await branches(repo);
+      if (values.json) json(list);
+      else {
+        table(list.map((b) => [b.name, [b.local && "local", b.remote && repo.remote].filter(Boolean).join(" + "),
+          ago(b.date), b.bench ? "bench" : ""]));
+      }
       break;
     }
     case "ls": {

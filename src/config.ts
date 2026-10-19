@@ -34,7 +34,9 @@ interface ConfigFile {
   root?: string;
   open?: OpenMode;
   command?: string;
-  /** Shell command that opens a terminal tab, for terminals bench doesn't know; gets $BENCH_PATH and $BENCH_RUN. */
+  /** Coding assistant to start next to the command, e.g. "claude" or "copilot"; the "tab" command gets it as $BENCH_ASSISTANT. */
+  assistant?: string;
+  /** Shell command that opens a terminal tab, for terminals bench doesn't know; gets $BENCH_PATH, $BENCH_RUN and $BENCH_TITLE. */
   tab?: string;
   /** Pool size for repos that don't set one when added. */
   pool?: number;
@@ -97,6 +99,7 @@ export const settings = () => {
     root: realpathIfExists(expandHome(c.root ?? "~/benches")),
     open: c.open ?? "none",
     command: c.command,
+    assistant: c.assistant,
     default: c.default,
     tab: c.tab,
     pool: c.pool ?? 2,

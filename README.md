@@ -20,7 +20,8 @@ With a pool of warm benches, that takes about a second, even in a big monorepo.
 - **Node.js 22.18 or newer** (runs TypeScript directly)
 - **git 2.31 or newer**
 - The background refresh uses launchd, so it's macOS only; elsewhere run `bench pool refresh` from cron
-- `--open tab` knows iTerm2 and Terminal on macOS; other terminals take a command in the config
+- `--open tab` knows tmux (a new window), cmux (a new workspace), iTerm2 and Terminal; other terminals take a
+  command in the config
 
 ## Install
 
@@ -62,6 +63,8 @@ bench new feat/PROJ-123-login -o tab -c claude # take a warm bench and start cla
 bench new feat/PROJ-123-login             # bench for the branch in the default repo (or the one you're in)
 bench new fix/PROJ-9 -r api --from develop
 bench go PROJ-123                         # path of the bench whose branch contains PROJ-123
+bench go PROJ-123 -o tab -t "PROJ-123 Login"   # open it in a new tab, titled
+bench branches -r api                     # branches to start from (--fetch updates them first)
 bench ls                                  # benches of all repos
 bench ls --all --mr                       # removed ones too, with their merge requests
 bench mr PROJ-123 -w                      # open the merge request of the bench's branch
@@ -134,7 +137,8 @@ Everything lives in `~/.config/bench/config.json` (or `$BENCH_CONFIG`); `bench a
 | `default` | Repo used outside a repo when there's no `--repo` |
 | `root` | Where benches go, as `<root>/<repo>/<branch>` (default `~/benches`) |
 | `open`, `command` | Defaults for `--open` and `--cmd` |
-| `tab` | Shell command that opens a tab, for terminals bench doesn't know; it gets `$BENCH_PATH` and `$BENCH_RUN` (the command line to run there). For example `wezterm cli spawn --cwd "$BENCH_PATH" -- $SHELL -lic "$BENCH_RUN; exec $SHELL"` |
+| `assistant` | Default for `--assistant`: the coding assistant to open next to the command, e.g. `"claude"` or `"copilot"`. bench hands it to the `tab` command as `$BENCH_ASSISTANT`, so a split tab can start it in its second pane |
+| `tab` | Shell command that opens a tab, for terminals bench doesn't know or a tab of your own (say, split in two); it gets `$BENCH_PATH`, `$BENCH_RUN` (the command line to run there, which also sets the tab's title when there is one), `$BENCH_TITLE` (`--title`) and `$BENCH_ASSISTANT` (`--assistant`). For example `wezterm cli spawn --cwd "$BENCH_PATH" -- $SHELL -lic "$BENCH_RUN; exec $SHELL"` |
 | `pool` | Pool size `bench add` gives a repo when you don't pass `--pool` (default 2) |
 | `refresh` | When the background refresh runs: daily at a time (default `"07:00"`; if the Mac sleeps then, it runs when it wakes) or every so many minutes (a number). Run `bench pool auto on` again after changing it |
 | `repos` | Name → `path` of the main checkout, plus any of the repo settings below |

@@ -29,6 +29,39 @@ export async function defaultBase(repo: Repo): Promise<string> {
   return head ? head.slice(repo.remote.length + 1) : "main";
 }
 
+/** A branch to start a bench from: local, on the remote, or both. */
+export interface Branch {
+  name: string;
+  local: boolean;
+  remote: boolean;
+  /** Of its newest commit, local or remote. */
+  date: string;
+  /** Whether a bench (not the main checkout) has it checked out. */
+  bench: boolean;
+}
+
+/** The repo's local branches and those of its remote, by name, the most recently committed to first. */
+export async function branches(repo: Repo): Promise<Branch[]> {
+  const [out, trees] = await Promise.all([
+    git(repo.path, "for-each-ref", "--format=%(refname)%09%(committerdate:iso-strict)", "refs/heads", `refs/remotes/${repo.remote}`),
+    worktrees(repo),
+  ]);
+  const benched = new Set(trees.filter((w) => !w.main).map((w) => w.branch));
+  const byName = new Map<string, Branch>();
+  for (const line of out.split("\n").filter(Boolean)) {
+    const [ref, date] = line.split("\t");
+    const remote = ref.startsWith("refs/remotes/");
+    const name = ref.slice(remote ? `refs/remotes/${repo.remote}/`.length : "refs/heads/".length);
+    if (remote && name === "HEAD") continue;
+    const branch = byName.get(name) ?? { name, local: false, remote: false, date, bench: benched.has(name) };
+    if (remote) branch.remote = true;
+    else branch.local = true;
+    if (Date.parse(date) > Date.parse(branch.date)) branch.date = date;
+    byName.set(name, branch);
+  }
+  return [...byName.values()].sort((a, b) => Date.parse(b.date) - Date.parse(a.date));
+}
+
 export interface Worktree {
   repo: Repo;
   path: string;
